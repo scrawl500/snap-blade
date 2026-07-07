@@ -1137,9 +1137,10 @@ async function sbFetch(qs, opt={}){
     headers: { 'apikey':SB_KEY, 'Authorization':'Bearer '+SB_KEY,
       'Content-Type':'application/json', ...(opt.headers||{}) }
   });
-  if(!r.ok){ const tx = await r.text().catch(()=> ''); throw new Error('Supabase '+r.status+(tx?': '+tx.slice(0,140):'')); }
-  if(r.status===204 || opt.method==='DELETE') return null;
-  return r.json();
+  const tx = await r.text().catch(()=> '');
+  if(!r.ok) throw new Error('Supabase '+r.status+(tx?': '+tx.slice(0,140):''));
+  if(!tx) return null;            // 201/204 等成功但無內容的回應
+  try{ return JSON.parse(tx); }catch(e){ return null; }
 }
 /* storage layer with graceful degradation:
    mode 'shared'   = Supabase,真正的跨玩家競技場
