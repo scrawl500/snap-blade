@@ -423,7 +423,9 @@ function homeSpinFrame(now){
 const imgCache = {};
 function bladeImage(blade){
   if(imgCache[blade.id] && imgCache[blade.id].complete) return imgCache[blade.id];
-  if(!imgCache[blade.id]){ const im = new Image(); im.src = blade.img; imgCache[blade.id] = im; }
+  if(!imgCache[blade.id]){ const im = new Image();
+    if(/^https?:/.test(blade.img)) im.crossOrigin='anonymous'; // CDN 圖:避免污染 canvas(碎裂系統要讀像素)
+    im.src = blade.img; imgCache[blade.id] = im; }
   return imgCache[blade.id];
 }
 function preloadBlades(list){
@@ -1167,8 +1169,8 @@ const SB_URL = 'https://ofrhninuuiphzqqvcrvq.supabase.co';
 const SB_KEY = 'sb_publishable_29p8mEdG4JzAkk9cTmwA_g_fwPD5VwN';
 const SB_TABLE = 'arena_teams';
 function sbReady(){ return /^https:\/\//.test(SB_URL) && SB_KEY.length > 40; }
-async function sbFetch(qs, opt={}){
-  const r = await fetch(SB_URL + '/rest/v1/' + SB_TABLE + qs, {
+async function sbCall(path, opt={}){
+  const r = await fetch(SB_URL + path, {
     ...opt,
     headers: { 'apikey':SB_KEY, 'Authorization':'Bearer '+SB_KEY,
       'Content-Type':'application/json', ...(opt.headers||{}) }
@@ -1177,6 +1179,51 @@ async function sbFetch(qs, opt={}){
   if(!r.ok) throw new Error('Supabase '+r.status+(tx?': '+tx.slice(0,140):''));
   if(!tx) return null;            // 201/204 等成功但無內容的回應
   try{ return JSON.parse(tx); }catch(e){ return null; }
+}
+function sbFetch(qs, opt={}){ return sbCall('/rest/v1/' + SB_TABLE + qs, opt); }
+function sbRpc(fn, args){ return sbCall('/rest/v1/rpc/'+fn, {method:'POST', body:JSON.stringify(args)}); }
+async function sbUpload(path, blob){
+  const r = await fetch(SB_URL + '/storage/v1/object/blades/' + path, {
+    method:'POST',
+    headers:{ 'apikey':SB_KEY, 'Authorization':'Bearer '+SB_KEY, 'Content-Type':blob.type },
+    body: blob
+  });
+  if(r.ok || r.status===409) return true; // 409 = 同一顆陀螺已上傳過,視同成功
+  const tx = await r.text().catch(()=> '');
+  throw new Error('Storage '+r.status+(tx?': '+tx.slice(0,120):''));
+}
+/* 陀螺圖上傳:dataURL -> WebP(不支援則 PNG)-> Supabase Storage 公開網址
+   任一步失敗就退回原本的 base64 內嵌,發佈不會因此失敗 */
+const WEBP_OK = (()=>{ try{ const c=document.createElement('canvas'); c.width=c.height=2;
+  return c.toDataURL('image/webp').indexOf('data:image/webp')===0; }catch(e){ return false; } })();
+function encodeBladeImg(dataUrl){
+  return new Promise((res,rej)=>{
+    const im=new Image();
+    im.onload=()=>{
+      const c=document.createElement('canvas'); c.width=im.width; c.height=im.height;
+      c.getContext('2d').drawImage(im,0,0);
+      const type = WEBP_OK ? 'image/webp' : 'image/png';
+      c.toBlob(b=> b?res({blob:b, ext:(WEBP_OK?'webp':'png')}):rej(new Error('編碼失敗')), type, 0.85);
+    };
+    im.onerror=()=>rej(new Error('圖片載入失敗'));
+    im.src=dataUrl;
+  });
+}
+async function arUploadBladeImgs(blades, teamId){
+  const out=[];
+  for(const b of blades){
+    const s=slimBlade(b);
+    if(ST.mode==='shared' && /^data:/.test(s.img||'')){
+      try{
+        const {blob, ext} = await encodeBladeImg(s.img);
+        const path = encodeURIComponent(teamId) + '/' + encodeURIComponent(b.id) + '.' + ext;
+        await sbUpload(path, blob);
+        s.img = SB_URL + '/storage/v1/object/public/blades/' + path;
+      }catch(e){ console.warn('圖片上傳失敗,改用內嵌:', e); }
+    }
+    out.push(s);
+  }
+  return out;
 }
 /* storage layer with graceful degradation:
    mode 'shared'   = Supabase,真正的跨玩家競技場
@@ -1257,7 +1304,7 @@ async function arEnsureSanctuary(){
   if(await stGet(AR_TEAM+'sanctuary')) return;
   const blades=await buildStarterBlades();
   if(blades.length<3) return;
-  const team={id:'sanctuary', name:'御三家', blades:blades.map(slimBlade), w:0,l:0, log:[], at:Date.now()};
+  const team={id:'sanctuary', name:'御三家', blades:await arUploadBladeImgs(blades,'sanctuary'), w:0,l:0, log:[], at:Date.now()};
   await stSet(AR_TEAM+'sanctuary', team);
   await arUpdateIndex('sanctuary',{n:'御三家',w:0,l:0,at:Date.now()});
   } finally { sanctuaryBuilding=false; }
@@ -1329,7 +1376,8 @@ function arenaPublishFlow(blades){
     const nm=$('#name-input').value.trim()||'無名戰隊';
     $('#ar-pub').disabled=true; $('#ar-pub').textContent='發佈中…';
     const old=await stGet(AR_TEAM+myArenaId());
-    const team={id:myArenaId(), name:nm, blades:blades.map(slimBlade),
+    const slim=await arUploadBladeImgs(blades, myArenaId());
+    const team={id:myArenaId(), name:nm, blades:slim,
       w:old?old.w:0, l:old?old.l:0, log:old?old.log:[], at:Date.now()};
     const ok=await stSet(AR_TEAM+myArenaId(), team);
     if(ok){ await arUpdateIndex(myArenaId(),{n:nm,w:team.w,l:team.l,at:team.at});
@@ -1416,13 +1464,18 @@ async function arConfirmFight(id){
 }
 async function arReport(oppId, challengerWon, score){
   if(oppId===myArenaId()) return;
+  const entry={n:DB.arenaName||'無名挑戰者', r:challengerWon?'atk-win':'atk-lose', s:score, at:Date.now()};
+  if(ST.mode==='shared'){
+    // 只傳勝負與一筆紀錄(數百 bytes),由資料庫端原子更新,不再整包覆寫
+    try{ await sbRpc('report_battle', {p_id:oppId, p_challenger_won:challengerWon, p_entry:entry}); }
+    catch(e){ console.error('回報戰績失敗:', e); }
+    return;
+  }
+  // 本機備援模式:維持原本的讀改寫
   const t=await stGet(AR_TEAM+oppId); if(!t) return;
   t.w=(t.w||0)+(challengerWon?0:1); t.l=(t.l||0)+(challengerWon?1:0);
-  t.log=t.log||[];
-  t.log.unshift({n:DB.arenaName||'無名挑戰者', r:challengerWon?'atk-win':'atk-lose', s:score, at:Date.now()});
-  t.log.length=Math.min(t.log.length,8);
+  t.log=t.log||[]; t.log.unshift(entry); t.log.length=Math.min(t.log.length,8);
   await stSet(AR_TEAM+oppId, t);
-  arUpdateIndex(oppId,{n:t.name,w:t.w,l:t.l,at:t.at||Date.now()});
 }
 
 /* --- team select: the player builds BOTH teams from the collection,
