@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
-<title>Snap Blade 快照戰陀</title>
+<title>Snap Blade</title>
 <style>
 :root{
   --paper:#faf6ec; --paper2:#f1ebdb; --card:#fffdf6;
@@ -240,10 +240,14 @@ label.big-btn input{display:none;}
       <canvas id="cap-canvas"></canvas>
       <div class="row gap" style="width:min(88vw,380px);" id="cap-tools">
         <button class="big-btn sm on" id="mk-fg">✏️ 圈主體</button>
-        <button class="big-btn sm" id="mk-clr">↺ 清除重畫</button>
+        <button class="big-btn sm" id="mk-erase">🧽 擦除</button>
+        <button class="big-btn sm" id="mk-restore">🖌 補回</button>
+        <button class="big-btn sm" id="mk-clr">↺ 重畫</button>
       </div>
       <div class="row" style="width:min(88vw,380px);" id="cap-tol-row"><span style="font-size:13px;color:var(--ink2);flex:none;">範圍</span>
         <input type="range" id="cap-tol" min="8" max="100" value="50"></div>
+      <div class="row" style="width:min(88vw,380px);" id="cap-brush-row"><span style="font-size:13px;color:var(--ink2);flex:none;">筆刷</span>
+        <input type="range" id="cap-brush" min="1" max="9" value="3"></div>
       <p class="hint small" id="cap-adj-hint">在照片上塗抹主體,橘色輪廓線圈出的就是會被剪下的範圍</p>
       <div class="row gap">
         <button class="big-btn" id="cap-retake">重選</button>
@@ -778,12 +782,30 @@ function drawRadar(canvas, stats){
     ctx.fillStyle='#4b4237'; ctx.fillText(stats[k],x,y+Math.round(W*0.032)); });
 }
 /* full pipeline: source canvas -> blade object (not yet saved) */
-function forgeBlade(srcCanvas, {useAlpha=false, tol=50, innate=null, name='', isEnemy=false, spinDir=null, fg=null, bg=null, keepMask=false} = {}){
+function stampPts(mask, w, h, pts, val, alphaData){
+  for(const p of pts){
+    const r = p.r || 6, r2 = r*r;
+    const x0=Math.max(0,p.x-r), x1=Math.min(w-1,p.x+r);
+    const y0=Math.max(0,p.y-r), y1=Math.min(h-1,p.y+r);
+    for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++){
+      if((x-p.x)**2+(y-p.y)**2 > r2) continue;
+      const i=y*w+x;
+      if(val && alphaData && alphaData[i*4+3]<30) continue; // 補回時不納入原圖透明像素
+      mask[i]=val;
+    }
+  }
+}
+function forgeBlade(srcCanvas, {useAlpha=false, tol=50, innate=null, name='', isEnemy=false, spinDir=null, fg=null, bg=null, keepMask=false, edits=null} = {}){
   const w=srcCanvas.width, h=srcCanvas.height;
   const data=srcCanvas.getContext('2d').getImageData(0,0,w,h).data;
   const mask = useAlpha ? alphaMaskFrom(data,w,h)
              :            segmentMask(data,w,h,tol,fg,bg);
-  if(!cleanMask(mask,w,h,fg)) return null;
+  // 擦除先套用:切斷主體與雜物的連結後,cleanMask 會自動丟掉小碎塊
+  if(edits && edits.erase && edits.erase.length) stampPts(mask,w,h,edits.erase,0);
+  const cleaned = cleanMask(mask,w,h,fg);
+  if(!cleaned && !(edits && edits.restore && edits.restore.length)) return null;
+  // 補回後套用:避免被 cleanMask 當成孤島清掉
+  if(edits && edits.restore && edits.restore.length) stampPts(mask,w,h,edits.restore,1, useAlpha?data:null);
   const an=analyzeMask(mask,w,h,data);
   if(!an || an.maxR<8) return null;
   const cut=buildCutout(srcCanvas,mask,an);
@@ -823,7 +845,7 @@ function drawMaskContour(ctx, mask, w, h, scale, color){
 ['#cap-canvas','#spin-canvas'].forEach(sel=>{
   document.querySelector(sel).addEventListener('touchmove', e=>e.preventDefault(), {passive:false});
 });
-const cap = { src:null, blade:null, spinRAF:0, fg:[], bg:[], mode:'fg', preAlpha:false };
+const cap = { src:null, blade:null, spinRAF:0, fg:[], bg:[], erase:[], restore:[], mode:'fg', preAlpha:false };
 
 function capStep(name){
   ['pick','adjust','spin'].forEach(s=>{ $('#cap-step-'+s).hidden = (s!==name); });
@@ -849,19 +871,19 @@ function capHandleFile(e){
       c.height = Math.max(2, Math.round(im.height*s));
       c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
       cap.src = c;
-      cap.fg = []; cap.bg = []; cap.mode = 'fg';
+      cap.fg = []; cap.bg = []; cap.erase = []; cap.restore = [];
       // detect pre-cut transparency (e.g. iOS「長按去背」複製出的 PNG)
       const d = c.getContext('2d').getImageData(0,0,c.width,c.height).data;
       let tr=0, op=0;
       for(let i=3;i<d.length;i+=4){ if(d[i]<30) tr++; else op++; }
       const n = c.width*c.height;
       cap.preAlpha = tr > n*0.05 && op > n*0.02;
-      $('#cap-tools').style.display = cap.preAlpha ? 'none' : '';
+      $('#mk-fg').style.display = cap.preAlpha ? 'none' : '';
       $('#cap-tol-row').style.display = cap.preAlpha ? 'none' : '';
       $('#cap-adj-hint').textContent = cap.preAlpha
-        ? '偵測到這張圖已經去好背了,直接採用!'
-        : '在照片上塗抹主體,橘色輪廓線圈出的就是會被剪下的範圍';
-      capSetMode('fg');
+        ? '偵測到這張圖已經去好背了!需要的話可用「擦除／補回」筆刷細修範圍'
+        : '塗抹主體圈出剪下範圍;「擦除／補回」可細修邊緣';
+      capSetMode(cap.preAlpha ? 'erase' : 'fg');
       capStep('adjust');
       capPreview();
     };
@@ -880,11 +902,22 @@ $('#cap-tol').addEventListener('input', ()=>{
 });
 $('#cap-retake').addEventListener('click', ()=>{ cap.fg=[]; cap.bg=[]; capStep('pick'); });
 
-/* --- scribble marking: paint over subject / background --- */
-function capSetMode(m){ cap.mode='fg'; }
-$('#mk-clr').addEventListener('click', ()=>{ cap.fg=[]; cap.bg=[]; capPreview(); });
+/* --- scribble marking: paint subject / erase / restore --- */
+function capSetMode(m){
+  cap.mode = m;
+  [['mk-fg','fg'],['mk-erase','erase'],['mk-restore','restore']].forEach(([id,mm])=>{
+    $('#'+id).classList.toggle('on', mm===m);
+  });
+}
+$('#mk-fg').addEventListener('click', ()=>capSetMode('fg'));
+$('#mk-erase').addEventListener('click', ()=>capSetMode('erase'));
+$('#mk-restore').addEventListener('click', ()=>capSetMode('restore'));
+$('#mk-clr').addEventListener('click', ()=>{ cap.fg=[]; cap.bg=[]; cap.erase=[]; cap.restore=[]; capPreview(); });
 
-function capBrushRad(){ return Math.max(3, Math.round(Math.min(cap.src.width,cap.src.height)*0.03)); }
+function capBrushRad(){
+  const base = Math.max(2, Math.min(cap.src.width,cap.src.height)*0.012);
+  return Math.max(2, Math.round(base * (+$('#cap-brush').value)));
+}
 function capPtFromEvent(ev){
   const r = ev.currentTarget.getBoundingClientRect();
   const x = Math.round((ev.clientX-r.left)/r.width * cap.src.width);
@@ -893,17 +926,19 @@ function capPtFromEvent(ev){
 }
 let capPainting = false, capLastPt = null;
 function capAddPt(p){
-  const arr = cap.mode==='fg' ? cap.fg : cap.bg;
+  const arr = cap.mode==='fg' ? cap.fg : cap.mode==='erase' ? cap.erase : cap.restore;
   const rad = capBrushRad();
-  if(capLastPt && (p.x-capLastPt.x)**2+(p.y-capLastPt.y)**2 < (rad*0.6)**2) return;
-  arr.push(p); capLastPt = p;
+  if(capLastPt && (p.x-capLastPt.x)**2+(p.y-capLastPt.y)**2 < (rad*0.5)**2) return;
+  arr.push({x:p.x, y:p.y, r:rad}); capLastPt = p;
   // instant visual feedback: dot on the preview canvas
   const ctx = $('#cap-canvas').getContext('2d');
-  ctx.fillStyle = cap.mode==='fg' ? 'rgba(201,111,78,.55)' : 'rgba(90,125,170,.55)';
+  ctx.fillStyle = cap.mode==='fg' ? 'rgba(201,111,78,.55)'
+    : cap.mode==='erase' ? 'rgba(75,66,55,.45)' : 'rgba(138,163,123,.6)';
   ctx.beginPath(); ctx.arc(p.x*2, p.y*2, rad*2, 0, TAU); ctx.fill();
 }
 $('#cap-canvas').addEventListener('pointerdown', ev=>{
-  if(!cap.src || cap.preAlpha) return;
+  if(!cap.src) return;
+  if(cap.preAlpha && cap.mode==='fg') capSetMode('erase');
   ev.preventDefault();
   ev.currentTarget.setPointerCapture(ev.pointerId);
   capPainting = true; capLastPt = null;
@@ -925,9 +960,10 @@ $('#cap-canvas').addEventListener('pointercancel', capEndPaint);
 function capPreview(){
   if(!cap.src) return;
   const tol = +$('#cap-tol').value;
+  const edits = {erase:cap.erase, restore:cap.restore};
   cap.blade = cap.preAlpha
-    ? forgeBlade(cap.src, {useAlpha:true, keepMask:true})
-    : forgeBlade(cap.src, {tol, fg:cap.fg, bg:cap.bg, keepMask:true});
+    ? forgeBlade(cap.src, {useAlpha:true, keepMask:true, edits})
+    : forgeBlade(cap.src, {tol, fg:cap.fg, bg:cap.bg, keepMask:true, edits});
   const cv = $('#cap-canvas');
   const w = cap.src.width, h = cap.src.height;
   cv.width = w*2; cv.height = h*2;
