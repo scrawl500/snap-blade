@@ -126,7 +126,7 @@ label.big-btn input{display:none;}
 /* DETAIL */
 #scr-detail .det-body{flex:1;overflow-y:auto;display:flex;flex-direction:column;align-items:center;gap:8px;
   padding-bottom:calc(env(safe-area-inset-bottom) + 20px);}
-#det-canvas{width:180px;height:180px;}
+#det-canvas{width:180px;height:180px;touch-action:none;cursor:grab;}
 #det-radar{width:230px;height:210px;}
 .stat-list{width:min(84vw,340px);display:flex;flex-direction:column;gap:5px;}
 .stat-row{display:flex;align-items:center;gap:8px;font-size:12px;}
@@ -1119,17 +1119,60 @@ function openDetail(id){
     `<div class="stat-row"><span class="sn">綜合戰力</span><b style="color:var(--terra);">${bladePowerLevel(b)}</b></div>`);
   sl.insertAdjacentHTML('beforeend',
     `<div class="stat-row"><span class="sn">戰績</span><b>${recordText(b)}</b></div>`);
-  // slow spin preview
+  // interactive spin preview: drag to whirl (like the home screen), eases back to idle
+  function makeStickerShadow(img){
+    const PAD=22, S=256+PAD*2;
+    const sil=document.createElement('canvas'); sil.width=sil.height=256;
+    const sx=sil.getContext('2d');
+    sx.drawImage(img,0,0,256,256);
+    sx.globalCompositeOperation='source-in';
+    sx.fillStyle='#4b4237'; sx.fillRect(0,0,256,256);
+    // 只取「影子」:把剪影畫到很遠的地方,留下的模糊投影就是羽化輪廓
+    const sh=document.createElement('canvas'); sh.width=sh.height=S;
+    const hx=sh.getContext('2d');
+    hx.shadowColor='rgba(75,66,55,.32)';
+    hx.shadowBlur=10; hx.shadowOffsetX=0; hx.shadowOffsetY=2000;
+    hx.drawImage(sil, PAD, PAD-2000);
+    return sh;
+  }
   const cv = $('#det-canvas'), ctx = cv.getContext('2d');
   const im = bladeImage(b);
   cancelAnimationFrame(detRAF);
-  let rot = 0, last = performance.now();
+  const dir = b.spinDir==='L' ? -1 : 1;
+  const st = { rot:rand(0,TAU), base:dir*0.9, om:dir*0.9, dragging:false, prevA:0, prevT:0 };
+  const angOf = ev=>{ const r=cv.getBoundingClientRect();
+    return Math.atan2(ev.clientY-(r.top+r.height/2), ev.clientX-(r.left+r.width/2)); };
+  cv.onpointerdown = ev=>{ ev.preventDefault(); cv.setPointerCapture(ev.pointerId);
+    st.dragging=true; st.prevA=angOf(ev); st.prevT=performance.now(); };
+  cv.onpointermove = ev=>{
+    if(!st.dragging) return;
+    ev.preventDefault();
+    const a=angOf(ev), t=performance.now();
+    let d=a-st.prevA; while(d>Math.PI)d-=TAU; while(d<-Math.PI)d+=TAU;
+    const dt=Math.max(8,t-st.prevT)/1000;
+    st.om = st.om*.5 + (d/dt)*.5;
+    st.rot += d;
+    st.prevA=a; st.prevT=t;
+  };
+  cv.onpointerup = cv.onpointercancel = ()=>{ st.dragging=false; };
+  let last = performance.now();
   (function frame(now){
     if(detId !== id || !$('#scr-detail').classList.contains('active')) return;
     const dt = Math.min(.05,(now-last)/1000); last = now;
-    rot += dt*2.4;
+    if(!st.dragging){
+      st.om = st.base + (st.om-st.base)*Math.exp(-0.55*dt); // 慢慢回到怠速
+      st.rot += st.om*dt;
+    }
     ctx.clearRect(0,0,cv.width,cv.height);
-    if(im.complete) drawBladeSprite(ctx, im, 180, 180, rot, 140, true);
+    if(!st.shadow && im.complete && im.naturalWidth) st.shadow = makeStickerShadow(im);
+    if(st.shadow){
+      // 貼紙浮空投影:輪廓與本體相同,固定往右下偏移(光源不動,貼紙轉)
+      const s=140/120, half=st.shadow.width/2*s;
+      ctx.save(); ctx.translate(180+4, 180+9); ctx.rotate(st.rot);
+      ctx.drawImage(st.shadow, -half, -half, st.shadow.width*s, st.shadow.height*s);
+      ctx.restore();
+    }
+    if(im.complete) drawBladeSprite(ctx, im, 180, 180, st.rot, 140, false); // 無殘影
     detRAF = requestAnimationFrame(frame);
   })(last);
 }
@@ -1485,8 +1528,9 @@ function openSelect(mode){
   sel.mode = mode;
   sel.need = (mode==='formal'||mode==='arena-setup'||mode==='arena-fight') ? 3 : 1;
   sel.picked = []; sel.team1 = []; sel.phase = 1;
-  if(DB.blades.length < 1){
-    openModal(`<h3>還沒有陀螺!</h3><p class="hint small" style="margin:0;">先去捕獲一顆吧</p>
+  if(DB.blades.length < sel.need){
+    openModal(`<h3>${DB.blades.length ? '陀螺不夠!' : '還沒有陀螺!'}</h3>
+      <p class="hint small" style="margin:0;">${DB.blades.length ? `這個模式需要 ${sel.need} 顆不同的陀螺` : '先去捕獲一顆吧'}</p>
       <div class="row gap"><button class="big-btn primary" id="m-ok">好</button></div>`);
     $('#m-ok').addEventListener('click', closeModal);
     return;
@@ -1497,11 +1541,10 @@ function openSelect(mode){
     const d = document.createElement('div'); d.className='card';
     d.innerHTML = `<img src="${b.img}"><div class="nm">${escapeHtml(b.name)}</div><div class="pw">戰力 ${bladePowerLevel(b)}</div><div class="pw">${recordText(b)}</div>`;
     d.addEventListener('click', ()=>{
-      if(sel.mode==='arena-setup' && sel.picked.includes(b.id)){
-        sel.picked = sel.picked.filter(id=>id!==b.id);
+      if(sel.picked.includes(b.id)){
+        sel.picked = sel.picked.filter(id=>id!==b.id);   // 再點一次 = 取消選取
       } else {
-        if(sel.mode==='arena-setup' && sel.picked.length>=sel.need) return;
-        if(sel.picked.length>=sel.need) sel.picked.shift();
+        if(sel.picked.length>=sel.need) return;          // 選滿了,先取消其他選取
         sel.picked.push(b.id);
       }
       updateSelUI(g);
@@ -1519,7 +1562,7 @@ function updateSelUI(g){
     : (sel.mode==='formal' ? '正式對戰 3 vs 3' : '單場對戰 1 vs 1') + '・' + team;
   $('#sel-hint').textContent = sel.mode==='arena-setup' ? '選 3 顆陀螺發佈上擂台(每顆只能選一次)'
     : sel.mode==='arena-fight' ? '選出你的 3 顆陀螺,打贏可以複製走對方一顆!'
-    : '為 ' + team + ' 選出 ' + sel.need + ' 顆陀螺(可重複選)'
+    : '為 ' + team + ' 選出 ' + sel.need + ' 顆陀螺(再點一次可取消)'
     + (sel.mode==='formal' ? ';先得 4 分獲勝,三戰未分勝負重排順序' : ';先得 4 分獲勝');
   [...g.children].forEach(d=>{
     const pos=[];
